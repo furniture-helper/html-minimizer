@@ -189,24 +189,15 @@ def generate_minimized_html(
 ) -> str:
     raw_bucket = _require_env("RAW_HTML_S3_BUCKET")
     rel_key = _safe_rel_key(s3_key)
-    local_path = Path("tmp") / rel_key
-    local_path.parent.mkdir(parents=True, exist_ok=True)
 
-    try:
-        logger.debug("Downloading raw HTML for %s", url)
-        s3_client.download_file(raw_bucket, s3_key, str(local_path))
-        logger.debug("Downloaded raw HTML for %s", url)
+    logger.debug("Downloading raw HTML for %s", url)
+    html_content = s3_client.get_object(Bucket=raw_bucket, Key=s3_key)["Body"].read().decode("utf-8")
+    logger.debug("Downloaded raw HTML for %s", url)
 
-        minimized_tree = boilerplate_remover.get_minimized_tree(str(local_path))
-        logger.debug("Generated minimized tree for %s", url)
+    minimized_tree = boilerplate_remover.get_minimized_tree_from_string(html_content)
+    logger.debug("Generated minimized tree for %s", url)
 
-        return minimized_tree.to_html()
-    finally:
-        try:
-            local_path.unlink(missing_ok=True)
-        except TypeError:
-            if local_path.exists():
-                local_path.unlink()
+    return minimized_tree.to_html()
 
 
 def upload_minimized_html_to_s3(s3_client, html: str, source_s3_key: str) -> str:
