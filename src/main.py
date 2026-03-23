@@ -1,7 +1,7 @@
+import logging
 import os
 import sys
-import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from io import BytesIO
 from pathlib import Path, PurePosixPath
 from typing import Optional
@@ -10,6 +10,40 @@ import boto3
 import psycopg
 from boilerplate_remover.BoilerplateRemover import BoilerplateRemover
 from botocore.exceptions import BotoCoreError, ClientError
+
+
+VALID_LOG_LEVELS = {
+    "CRITICAL": logging.CRITICAL,
+    "ERROR": logging.ERROR,
+    "WARNING": logging.WARNING,
+    "WARN": logging.WARNING,
+    "INFO": logging.INFO,
+    "DEBUG": logging.DEBUG,
+    "NOTSET": logging.NOTSET,
+}
+
+
+def _get_log_level() -> int:
+    raw_level = os.getenv("LOG_LEVEL", "INFO").strip().upper()
+    resolved_level = VALID_LOG_LEVELS.get(raw_level)
+
+    if resolved_level is None:
+        sys.stderr.write(
+            f"Invalid LOG_LEVEL={raw_level!r}. Falling back to INFO. "
+            f"Valid values: {', '.join(sorted(VALID_LOG_LEVELS))}\n"
+        )
+        return logging.INFO
+
+    return resolved_level
+
+
+logging.basicConfig(
+    level=logging.WARNING,
+    format="%(asctime)s %(levelname)s [%(processName)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
+logger.setLevel(_get_log_level())
 
 
 def _env(*names: str, default: Optional[str] = None) -> Optional[str]:
@@ -76,6 +110,7 @@ def get_db_connection():
 
     return psycopg.connect(**connection_kwargs, connect_timeout=connect_timeout)
 
+
 def _get_batch_limit() -> int:
     raw = _env("MINIMIZE_BATCH_LIMIT", default="10")
     try:
@@ -86,6 +121,7 @@ def _get_batch_limit() -> int:
     if value <= 0:
         raise RuntimeError(f"Invalid MINIMIZE_BATCH_LIMIT: {value}. Must be > 0.")
     return value
+
 
 def get_s3_keys_to_minimize() -> list[tuple[str, str]]:
     limit = _get_batch_limit()
@@ -108,12 +144,13 @@ def get_s3_keys_to_minimize() -> list[tuple[str, str]]:
             cur.execute(query, (limit,))
             return [(row[0], row[1]) for row in cur.fetchall()]
 
+
 def download_anchor_tree_from_s3() -> Path:
     cache_path = Path(".cache") / "anchor_tree.pkl"
     cache_path.parent.mkdir(parents=True, exist_ok=True)
 
     if cache_path.exists():
-        print(f"Anchor tree cache exists at {cache_path}, skipping download")
+        logger.info("Anchor tree cache exists at %s, skipping download", cache_path)
         return cache_path
 
     s3_bucket = _require_env("ANCHOR_TREE_S3_BUCKET")
@@ -122,11 +159,15 @@ def download_anchor_tree_from_s3() -> Path:
     full_key = _join_s3_key(s3_prefix, s3_key)
 
     try:
-        s3 = boto3.client("s3")
+        s3 = boto3.client("s3", region_name="eu-west-1")
         response = s3.get_object(Bucket=s3_bucket, Key=full_key)
         cache_path.write_bytes(response["Body"].read())
         size_bytes = response.get("ContentLength", 0)
-        print(f"Anchor tree downloaded: {size_bytes / 1024 / 1024:.2f} MB -> {cache_path}")
+        logger.info(
+            "Anchor tree downloaded: %.2f MB -> %s",
+            size_bytes / 1024 / 1024,
+            cache_path,
+        )
         return cache_path
     except ClientError as error:
         error_code = error.response["Error"].get("Code", "Unknown")
@@ -139,22 +180,23 @@ def download_anchor_tree_from_s3() -> Path:
         raise RuntimeError(f"S3 download failed: {error}") from error
 
 
-def generate_minimized_html(s3_key: str, s3_client, boilerplate_remover: BoilerplateRemover) -> str:
+def generate_minimized_html(
+    s3_key: str,
+    url: str,
+    s3_client,
+    boilerplate_remover: BoilerplateRemover,
+) -> str:
     raw_bucket = _require_env("RAW_HTML_S3_BUCKET")
     rel_key = _safe_rel_key(s3_key)
-    local_path = Path("tmp") / rel_key
-    local_path.parent.mkdir(parents=True, exist_ok=True)
 
-    try:
-        s3_client.download_file(raw_bucket, s3_key, str(local_path))
-        minimized_tree = boilerplate_remover.get_minimized_tree(str(local_path))
-        return minimized_tree.to_html()
-    finally:
-        try:
-            local_path.unlink(missing_ok=True)
-        except TypeError:
-            if local_path.exists():
-                local_path.unlink()
+    logger.debug("Downloading raw HTML for %s", url)
+    html_content = s3_client.get_object(Bucket=raw_bucket, Key=s3_key)["Body"].read().decode("utf-8")
+    logger.debug("Downloaded raw HTML for %s", url)
+
+    minimized_tree = boilerplate_remover.get_minimized_tree_from_string(html_content)
+    logger.debug("Generated minimized tree for %s", url)
+
+    return minimized_tree.to_html()
 
 
 def upload_minimized_html_to_s3(s3_client, html: str, source_s3_key: str) -> str:
@@ -172,6 +214,13 @@ def upload_minimized_html_to_s3(s3_client, html: str, source_s3_key: str) -> str
 
 
 def update_minimized_database(url: str, minimized_s3_key: str) -> None:
+    bulk_update_minimized_database([(url, minimized_s3_key)])
+
+
+def bulk_update_minimized_database(results: list[tuple[str, str]]) -> None:
+    """Upsert multiple pages in a single DB round-trip."""
+    if not results:
+        return
     query = """
         INSERT INTO minimized_pages (url, s3_key, last_minimized_at)
         VALUES (%s, %s, NOW())
@@ -180,47 +229,71 @@ def update_minimized_database(url: str, minimized_s3_key: str) -> None:
         SET s3_key = EXCLUDED.s3_key,
             last_minimized_at = EXCLUDED.last_minimized_at
     """
-
     with get_db_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(query, (url, minimized_s3_key))
+            cur.executemany(query, results)
         conn.commit()
 
 
-_thread_local = threading.local()
+# Module-level globals — one instance per worker process
+_process_s3_client = None
+_process_boilerplate_remover = None
 
 
-def _get_thread_resources():
-    if not hasattr(_thread_local, "boilerplate_remover"):
-        _thread_local.boilerplate_remover = BoilerplateRemover()
-    if not hasattr(_thread_local, "s3_client"):
-        _thread_local.s3_client = boto3.client("s3")
-    return _thread_local.s3_client, _thread_local.boilerplate_remover
+def _init_process_worker():
+    """Initializer called once per worker process before any tasks run."""
+    global _process_s3_client, _process_boilerplate_remover
+    logger.debug("Creating BoilerplateRemover instance for process")
+    _process_boilerplate_remover = BoilerplateRemover()
+    logger.debug("BoilerplateRemover instance created for process")
+    logger.debug("Creating S3 client for process")
+    _process_s3_client = boto3.client("s3", region_name="eu-west-1")
+    logger.debug("S3 client created for process")
+
+
+def _get_worker_resources():
+    """Return process-level resources, initializing lazily if needed."""
+    global _process_s3_client, _process_boilerplate_remover
+    if _process_boilerplate_remover is None:
+        logger.debug("Creating BoilerplateRemover instance for process")
+        _process_boilerplate_remover = BoilerplateRemover()
+        logger.debug("BoilerplateRemover instance created for process")
+    if _process_s3_client is None:
+        logger.debug("Creating S3 client for process")
+        _process_s3_client = boto3.client("s3", region_name="eu-west-1")
+        logger.debug("S3 client created for process")
+    return _process_s3_client, _process_boilerplate_remover
 
 
 def _minimize_worker(item: tuple[str, str]) -> tuple[str, str]:
     s3_key, url = item
-    s3_client, boilerplate_remover = _get_thread_resources()
-    minimized_html = generate_minimized_html(s3_key, s3_client, boilerplate_remover)
+    s3_client, boilerplate_remover = _get_worker_resources()
+
+    logger.debug("Minimizing %s", url)
+    minimized_html = generate_minimized_html(s3_key, url, s3_client, boilerplate_remover)
+    logger.debug("Minimized %s", url)
+
     minimized_s3_key = upload_minimized_html_to_s3(s3_client, minimized_html, s3_key)
-    update_minimized_database(url, minimized_s3_key)
+    logger.debug("Uploaded %s", url)
+
     return minimized_s3_key, url
 
 
 if __name__ == "__main__":
     try:
-        # Fail fast for required worker buckets before spawning threads.
         _require_env("RAW_HTML_S3_BUCKET")
         _require_env("MINIMIZED_HTML_S3_BUCKET")
 
         items = get_s3_keys_to_minimize()
         pending_count = len(items)
-        print(f"{pending_count} pages to minimize")
+        logger.debug("%s pages to minimize", pending_count)
 
         download_anchor_tree_from_s3()
 
+        completed: list[tuple[str, str]] = []  # (url, minimized_s3_key)
+
         max_workers = int(_env("MAX_WORKERS", default="4"))
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        with ProcessPoolExecutor(max_workers=max_workers, initializer=_init_process_worker) as executor:
             futures = {executor.submit(_minimize_worker, item): item for item in items}
 
             for future in as_completed(futures):
@@ -228,10 +301,25 @@ if __name__ == "__main__":
                 pending_count -= 1
                 try:
                     minimized_s3_key, _ = future.result()
-                    print(f"Minimized: {url} ({source_s3_key} -> {minimized_s3_key}) ({pending_count} remaining)")
-                except Exception as error:
-                    print(f"Failed to minimize {url} ({source_s3_key}): {error}", file=sys.stderr)
+                    completed.append((url, minimized_s3_key))
+                    logger.info(
+                        "Minimized: %s (%s -> %s) (%s remaining)",
+                        url,
+                        source_s3_key,
+                        minimized_s3_key,
+                        pending_count,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to minimize %s (%s)",
+                        url,
+                        source_s3_key,
+                    )
 
-    except (RuntimeError, psycopg.Error) as error:
-        print(f"Error: {error}", file=sys.stderr)
+        if completed:
+            bulk_update_minimized_database(completed)
+            logger.debug("Bulk updated minimized database for %d pages", len(completed))
+
+    except (RuntimeError, psycopg.Error):
+        logger.exception("Error while running minimizer")
         raise SystemExit(1)
