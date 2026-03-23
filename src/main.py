@@ -1,8 +1,7 @@
 import logging
 import os
 import sys
-import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from io import BytesIO
 from pathlib import Path, PurePosixPath
 from typing import Optional
@@ -40,7 +39,7 @@ def _get_log_level() -> int:
 
 logging.basicConfig(
     level=logging.WARNING,
-    format="%(asctime)s %(levelname)s [%(threadName)s] %(message)s",
+    format="%(asctime)s %(levelname)s [%(processName)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger(__name__)
@@ -215,6 +214,13 @@ def upload_minimized_html_to_s3(s3_client, html: str, source_s3_key: str) -> str
 
 
 def update_minimized_database(url: str, minimized_s3_key: str) -> None:
+    bulk_update_minimized_database([(url, minimized_s3_key)])
+
+
+def bulk_update_minimized_database(results: list[tuple[str, str]]) -> None:
+    """Upsert multiple pages in a single DB round-trip."""
+    if not results:
+        return
     query = """
         INSERT INTO minimized_pages (url, s3_key, last_minimized_at)
         VALUES (%s, %s, NOW())
@@ -223,33 +229,45 @@ def update_minimized_database(url: str, minimized_s3_key: str) -> None:
         SET s3_key = EXCLUDED.s3_key,
             last_minimized_at = EXCLUDED.last_minimized_at
     """
-
     with get_db_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(query, (url, minimized_s3_key))
+            cur.executemany(query, results)
         conn.commit()
 
 
-_thread_local = threading.local()
+# Module-level globals — one instance per worker process
+_process_s3_client = None
+_process_boilerplate_remover = None
 
 
-def _get_thread_resources():
-    if not hasattr(_thread_local, "boilerplate_remover"):
-        logger.debug("Creating BoilerplateRemover instance for thread")
-        _thread_local.boilerplate_remover = BoilerplateRemover()
-        logger.debug("BoilerplateRemover instance created for thread")
+def _init_process_worker():
+    """Initializer called once per worker process before any tasks run."""
+    global _process_s3_client, _process_boilerplate_remover
+    logger.debug("Creating BoilerplateRemover instance for process")
+    _process_boilerplate_remover = BoilerplateRemover()
+    logger.debug("BoilerplateRemover instance created for process")
+    logger.debug("Creating S3 client for process")
+    _process_s3_client = boto3.client("s3", region_name="eu-west-1")
+    logger.debug("S3 client created for process")
 
-    if not hasattr(_thread_local, "s3_client"):
-        logger.debug("Creating S3 client for thread")
-        _thread_local.s3_client = boto3.client("s3", region_name="eu-west-1")
-        logger.debug("S3 client created for thread")
 
-    return _thread_local.s3_client, _thread_local.boilerplate_remover
+def _get_worker_resources():
+    """Return process-level resources, initializing lazily if needed."""
+    global _process_s3_client, _process_boilerplate_remover
+    if _process_boilerplate_remover is None:
+        logger.debug("Creating BoilerplateRemover instance for process")
+        _process_boilerplate_remover = BoilerplateRemover()
+        logger.debug("BoilerplateRemover instance created for process")
+    if _process_s3_client is None:
+        logger.debug("Creating S3 client for process")
+        _process_s3_client = boto3.client("s3", region_name="eu-west-1")
+        logger.debug("S3 client created for process")
+    return _process_s3_client, _process_boilerplate_remover
 
 
 def _minimize_worker(item: tuple[str, str]) -> tuple[str, str]:
     s3_key, url = item
-    s3_client, boilerplate_remover = _get_thread_resources()
+    s3_client, boilerplate_remover = _get_worker_resources()
 
     logger.debug("Minimizing %s", url)
     minimized_html = generate_minimized_html(s3_key, url, s3_client, boilerplate_remover)
@@ -257,9 +275,6 @@ def _minimize_worker(item: tuple[str, str]) -> tuple[str, str]:
 
     minimized_s3_key = upload_minimized_html_to_s3(s3_client, minimized_html, s3_key)
     logger.debug("Uploaded %s", url)
-
-    update_minimized_database(url, minimized_s3_key)
-    logger.debug("Updated minimized database for %s", url)
 
     return minimized_s3_key, url
 
@@ -275,8 +290,10 @@ if __name__ == "__main__":
 
         download_anchor_tree_from_s3()
 
+        completed: list[tuple[str, str]] = []  # (url, minimized_s3_key)
+
         max_workers = int(_env("MAX_WORKERS", default="4"))
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        with ProcessPoolExecutor(max_workers=max_workers, initializer=_init_process_worker) as executor:
             futures = {executor.submit(_minimize_worker, item): item for item in items}
 
             for future in as_completed(futures):
@@ -284,6 +301,7 @@ if __name__ == "__main__":
                 pending_count -= 1
                 try:
                     minimized_s3_key, _ = future.result()
+                    completed.append((url, minimized_s3_key))
                     logger.info(
                         "Minimized: %s (%s -> %s) (%s remaining)",
                         url,
@@ -297,6 +315,10 @@ if __name__ == "__main__":
                         url,
                         source_s3_key,
                     )
+
+        if completed:
+            bulk_update_minimized_database(completed)
+            logger.debug("Bulk updated minimized database for %d pages", len(completed))
 
     except (RuntimeError, psycopg.Error):
         logger.exception("Error while running minimizer")
