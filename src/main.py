@@ -1,6 +1,9 @@
 import logging
 import os
 import sys
+import time
+import uuid
+from collections import OrderedDict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from io import BytesIO
 from pathlib import Path, PurePosixPath
@@ -75,6 +78,136 @@ def _join_s3_key(prefix: Optional[str], key: str) -> str:
     return f"{prefix.rstrip('/')}/{key.lstrip('/')}"
 
 
+def _normalize_domain(domain: Optional[str]) -> str:
+    if not domain:
+        return ""
+    normalized = domain.strip().lower()
+    if normalized.startswith("www."):
+        normalized = normalized[4:]
+    return normalized
+
+
+def _get_anchor_tree_cache_dir() -> Path:
+    cache_dir = Path(_env("ANCHOR_TREE_CACHE_DIR", default=".cache/anchor_tree"))
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir
+
+
+def _get_anchor_tree_candidates(domain: Optional[str]) -> list[tuple[str, str]]:
+    """Return ordered candidate keys as (label, full_s3_key)."""
+    s3_prefix = _env("ANCHOR_TREE_S3_PREFIX")
+    key_template = _env("ANCHOR_TREE_S3_KEY_TEMPLATE", default="anchor_tree_{domain}.pkl")
+    default_key = _env("ANCHOR_TREE_DEFAULT_S3_KEY", "ANCHOR_TREE_S3_KEY")
+
+    candidates: list[tuple[str, str]] = []
+    normalized_domain = _normalize_domain(domain)
+
+    if normalized_domain:
+        rendered = key_template.format(domain=normalized_domain)
+        candidates.append((f"domain:{normalized_domain}", _join_s3_key(s3_prefix, rendered)))
+
+    if default_key:
+        default_full_key = _join_s3_key(s3_prefix, default_key)
+        if all(default_full_key != full_key for _, full_key in candidates):
+            candidates.append(("default", default_full_key))
+
+    if not candidates:
+        raise RuntimeError(
+            "Anchor tree key configuration is missing. Set ANCHOR_TREE_S3_KEY_TEMPLATE or "
+            "ANCHOR_TREE_DEFAULT_S3_KEY/ANCHOR_TREE_S3_KEY."
+        )
+
+    return candidates
+
+
+def _anchor_cache_path_for_key(full_s3_key: str) -> Path:
+    rel_key = _safe_rel_key(full_s3_key)
+    return _get_anchor_tree_cache_dir() / rel_key
+
+
+def _download_anchor_tree_for_domain(s3_client, domain: Optional[str]) -> Path:
+    bucket = _require_env("ANCHOR_TREE_S3_BUCKET")
+    candidates = _get_anchor_tree_candidates(domain)
+    errors: list[str] = []
+
+    for label, full_key in candidates:
+        cache_path = _anchor_cache_path_for_key(full_key)
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if cache_path.exists():
+            logger.debug("Anchor tree cache hit for %s at %s", label, cache_path)
+            return cache_path
+
+        try:
+            logger.debug("Downloading anchor tree (%s) from s3://%s/%s", label, bucket, full_key)
+            response = s3_client.get_object(Bucket=bucket, Key=full_key)
+            tmp_path = cache_path.with_suffix(
+                f"{cache_path.suffix}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+            )
+            payload = response["Body"].read()
+            tmp_path.write_bytes(payload)
+
+            # On Windows, replacing a file can fail if another process has it open.
+            # If another process already published the cache file, treat that as a cache hit.
+            published = False
+            for _ in range(5):
+                if cache_path.exists():
+                    try:
+                        tmp_path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                    return cache_path
+                try:
+                    os.replace(tmp_path, cache_path)
+                    published = True
+                    break
+                except PermissionError:
+                    if cache_path.exists():
+                        try:
+                            tmp_path.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                        return cache_path
+                    time.sleep(0.05)
+
+            if not published:
+                if cache_path.exists():
+                    try:
+                        tmp_path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                    return cache_path
+                raise PermissionError(f"Unable to publish anchor tree cache file: {cache_path}")
+
+            logger.info("Anchor tree downloaded for %s -> %s", label, cache_path)
+            return cache_path
+        except ClientError as error:
+            error_code = error.response["Error"].get("Code", "Unknown")
+            if error_code == "NoSuchKey":
+                errors.append(f"{label}=s3://{bucket}/{full_key} (not found)")
+                continue
+            if error_code in ("NoSuchBucket", "AccessDenied"):
+                raise PermissionError(f"S3 access error ({error_code}): s3://{bucket}/{full_key}") from error
+            raise
+        except BotoCoreError as error:
+            raise RuntimeError(f"S3 download failed for s3://{bucket}/{full_key}: {error}") from error
+
+    raise FileNotFoundError(
+        "No anchor tree found for domain candidates. Tried: " + "; ".join(errors)
+    )
+
+
+def _get_domain_remover_cache_size() -> int:
+    raw = _env("ANCHOR_TREE_PROCESS_CACHE_SIZE", default="64")
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        raise RuntimeError(f"Invalid ANCHOR_TREE_PROCESS_CACHE_SIZE: {raw!r}. Expected a positive integer.")
+    if value <= 0:
+        raise RuntimeError(f"Invalid ANCHOR_TREE_PROCESS_CACHE_SIZE: {value}. Must be > 0.")
+    return value
+
+
 def get_db_connection():
     database_url = _env("DATABASE_URL")
     connect_timeout = int(_env("PGCONNECT_TIMEOUT", default="10"))
@@ -123,10 +256,10 @@ def _get_batch_limit() -> int:
     return value
 
 
-def get_s3_keys_to_minimize() -> list[tuple[str, str]]:
+def get_s3_keys_to_minimize() -> list[tuple[str, str, Optional[str]]]:
     limit = _get_batch_limit()
     query = """
-        SELECT pages.s3_key, pages.url
+        SELECT pages.s3_key, pages.url, pages.domain
         FROM pages
         LEFT JOIN minimized_pages ON pages.url = minimized_pages.url
         WHERE (
@@ -142,42 +275,7 @@ def get_s3_keys_to_minimize() -> list[tuple[str, str]]:
     with get_db_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(query, (limit,))
-            return [(row[0], row[1]) for row in cur.fetchall()]
-
-
-def download_anchor_tree_from_s3() -> Path:
-    cache_path = Path(".cache") / "anchor_tree.pkl"
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-
-    if cache_path.exists():
-        logger.info("Anchor tree cache exists at %s, skipping download", cache_path)
-        return cache_path
-
-    s3_bucket = _require_env("ANCHOR_TREE_S3_BUCKET")
-    s3_key = _require_env("ANCHOR_TREE_S3_KEY")
-    s3_prefix = _env("ANCHOR_TREE_S3_PREFIX")
-    full_key = _join_s3_key(s3_prefix, s3_key)
-
-    try:
-        s3 = boto3.client("s3", region_name="eu-west-1")
-        response = s3.get_object(Bucket=s3_bucket, Key=full_key)
-        cache_path.write_bytes(response["Body"].read())
-        size_bytes = response.get("ContentLength", 0)
-        logger.info(
-            "Anchor tree downloaded: %.2f MB -> %s",
-            size_bytes / 1024 / 1024,
-            cache_path,
-        )
-        return cache_path
-    except ClientError as error:
-        error_code = error.response["Error"].get("Code", "Unknown")
-        if error_code == "NoSuchKey":
-            raise FileNotFoundError(f"S3 object not found: s3://{s3_bucket}/{full_key}") from error
-        if error_code in ("NoSuchBucket", "AccessDenied"):
-            raise PermissionError(f"S3 access error ({error_code}): s3://{s3_bucket}/{full_key}") from error
-        raise
-    except BotoCoreError as error:
-        raise RuntimeError(f"S3 download failed: {error}") from error
+            return [(row[0], row[1], row[2]) for row in cur.fetchall()]
 
 
 def generate_minimized_html(
@@ -187,8 +285,6 @@ def generate_minimized_html(
     boilerplate_remover: BoilerplateRemover,
 ) -> str:
     raw_bucket = _require_env("RAW_HTML_S3_BUCKET")
-    rel_key = _safe_rel_key(s3_key)
-
     logger.debug("Downloading raw HTML for %s", url)
     html_content = s3_client.get_object(Bucket=raw_bucket, Key=s3_key)["Body"].read().decode("utf-8")
     logger.debug("Downloaded raw HTML for %s", url)
@@ -235,17 +331,14 @@ def bulk_update_minimized_database(results: list[tuple[str, str]]) -> None:
         conn.commit()
 
 
-# Module-level globals — one instance per worker process
+# Module-level globals — one set per worker process
 _process_s3_client = None
-_process_boilerplate_remover = None
+_process_boilerplate_removers: OrderedDict[str, BoilerplateRemover] = OrderedDict()
 
 
 def _init_process_worker():
     """Initializer called once per worker process before any tasks run."""
-    global _process_s3_client, _process_boilerplate_remover
-    logger.debug("Creating BoilerplateRemover instance for process")
-    _process_boilerplate_remover = BoilerplateRemover()
-    logger.debug("BoilerplateRemover instance created for process")
+    global _process_s3_client
     logger.debug("Creating S3 client for process")
     _process_s3_client = boto3.client("s3", region_name="eu-west-1")
     logger.debug("S3 client created for process")
@@ -253,21 +346,41 @@ def _init_process_worker():
 
 def _get_worker_resources():
     """Return process-level resources, initializing lazily if needed."""
-    global _process_s3_client, _process_boilerplate_remover
-    if _process_boilerplate_remover is None:
-        logger.debug("Creating BoilerplateRemover instance for process")
-        _process_boilerplate_remover = BoilerplateRemover()
-        logger.debug("BoilerplateRemover instance created for process")
+    global _process_s3_client
     if _process_s3_client is None:
         logger.debug("Creating S3 client for process")
         _process_s3_client = boto3.client("s3", region_name="eu-west-1")
         logger.debug("S3 client created for process")
-    return _process_s3_client, _process_boilerplate_remover
+    return _process_s3_client
 
 
-def _minimize_worker(item: tuple[str, str]) -> tuple[str, str]:
-    s3_key, url = item
-    s3_client, boilerplate_remover = _get_worker_resources()
+def _get_or_create_remover_for_domain(s3_client, domain: Optional[str]) -> BoilerplateRemover:
+    normalized_domain = _normalize_domain(domain)
+    cache_key = normalized_domain or "__default__"
+
+    remover = _process_boilerplate_removers.get(cache_key)
+    if remover is not None:
+        _process_boilerplate_removers.move_to_end(cache_key)
+        return remover
+
+    anchor_tree_cache_path = _download_anchor_tree_for_domain(s3_client, normalized_domain)
+    logger.debug("Creating BoilerplateRemover instance for domain=%s", normalized_domain or "default")
+    remover = BoilerplateRemover(cache_path=str(anchor_tree_cache_path))
+    _process_boilerplate_removers[cache_key] = remover
+    _process_boilerplate_removers.move_to_end(cache_key)
+
+    max_size = _get_domain_remover_cache_size()
+    while len(_process_boilerplate_removers) > max_size:
+        evicted_domain, _ = _process_boilerplate_removers.popitem(last=False)
+        logger.debug("Evicted domain remover cache entry: %s", evicted_domain)
+
+    return remover
+
+
+def _minimize_worker(item: tuple[str, str, Optional[str]]) -> tuple[str, str]:
+    s3_key, url, domain = item
+    s3_client = _get_worker_resources()
+    boilerplate_remover = _get_or_create_remover_for_domain(s3_client, domain)
 
     logger.debug("Minimizing %s", url)
     minimized_html = generate_minimized_html(s3_key, url, s3_client, boilerplate_remover)
@@ -283,12 +396,13 @@ if __name__ == "__main__":
     try:
         _require_env("RAW_HTML_S3_BUCKET")
         _require_env("MINIMIZED_HTML_S3_BUCKET")
+        _require_env("ANCHOR_TREE_S3_BUCKET")
 
         items = get_s3_keys_to_minimize()
         pending_count = len(items)
         logger.debug("%s pages to minimize", pending_count)
 
-        download_anchor_tree_from_s3()
+        _get_anchor_tree_cache_dir()
 
         completed: list[tuple[str, str]] = []  # (url, minimized_s3_key)
 
@@ -297,7 +411,7 @@ if __name__ == "__main__":
             futures = {executor.submit(_minimize_worker, item): item for item in items}
 
             for future in as_completed(futures):
-                source_s3_key, url = futures[future]
+                source_s3_key, url, _ = futures[future]
                 pending_count -= 1
                 try:
                     minimized_s3_key, _ = future.result()
