@@ -145,39 +145,60 @@ def get_s3_keys_to_minimize() -> list[tuple[str, str]]:
             return [(row[0], row[1]) for row in cur.fetchall()]
 
 
-def download_anchor_tree_from_s3() -> Path:
-    cache_path = Path(".cache") / "anchor_tree.pkl"
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-
-    if cache_path.exists():
-        logger.info("Anchor tree cache exists at %s, skipping download", cache_path)
-        return cache_path
+def download_anchor_trees_from_s3() -> list[Path]:
+    """
+    Download all anchor tree files from the S3 bucket and store them in .cache/anchor_trees/.
+    """
+    cache_dir = Path(".cache") / "anchor_trees"
+    cache_dir.mkdir(parents=True, exist_ok=True)
 
     s3_bucket = _require_env("ANCHOR_TREE_S3_BUCKET")
-    s3_key = _require_env("ANCHOR_TREE_S3_KEY")
     s3_prefix = _env("ANCHOR_TREE_S3_PREFIX")
-    full_key = _join_s3_key(s3_prefix, s3_key)
-
+    # Download all objects under the prefix (or all if prefix is None)
     try:
         s3 = boto3.client("s3", region_name="eu-west-1")
-        response = s3.get_object(Bucket=s3_bucket, Key=full_key)
-        cache_path.write_bytes(response["Body"].read())
-        size_bytes = response.get("ContentLength", 0)
-        logger.info(
-            "Anchor tree downloaded: %.2f MB -> %s",
-            size_bytes / 1024 / 1024,
-            cache_path,
-        )
-        return cache_path
-    except ClientError as error:
-        error_code = error.response["Error"].get("Code", "Unknown")
-        if error_code == "NoSuchKey":
-            raise FileNotFoundError(f"S3 object not found: s3://{s3_bucket}/{full_key}") from error
-        if error_code in ("NoSuchBucket", "AccessDenied"):
-            raise PermissionError(f"S3 access error ({error_code}): s3://{s3_bucket}/{full_key}") from error
-        raise
-    except BotoCoreError as error:
-        raise RuntimeError(f"S3 download failed: {error}") from error
+        paginator = s3.get_paginator("list_objects_v2")
+        list_kwargs = {"Bucket": s3_bucket}
+        if s3_prefix:
+            list_kwargs["Prefix"] = s3_prefix
+        downloaded_paths = []
+        for page in paginator.paginate(**list_kwargs):
+            for obj in page.get("Contents", []):
+                key = obj["Key"]
+                # Use relative path under prefix for local filename
+                rel_key = key[len(s3_prefix):].lstrip("/") if s3_prefix and key.startswith(s3_prefix) else key
+                local_path = cache_dir / rel_key.replace("/", "_")
+                if local_path.exists():
+                    logger.info("Anchor tree cache exists at %s, skipping download", local_path)
+                else:
+                    try:
+                        response = s3.get_object(Bucket=s3_bucket, Key=key)
+                        local_path.write_bytes(response["Body"].read())
+                        size_bytes = response.get("ContentLength", 0)
+                        logger.info(
+                            "Anchor tree downloaded: %.2f MB -> %s",
+                            size_bytes / 1024 / 1024,
+                            local_path,
+                        )
+                    except ClientError as error:
+                        error_code = error.response["Error"].get("Code", "Unknown")
+                        if error_code == "NoSuchKey":
+                            logger.error(f"S3 object not found: s3://{s3_bucket}/{key}")
+                            continue
+                        if error_code in ("NoSuchBucket", "AccessDenied"):
+                            logger.error(f"S3 access error ({error_code}): s3://{s3_bucket}/{key}")
+                            continue
+                        logger.error(f"S3 error for key {key}: {error}")
+                        continue
+                    except BotoCoreError as error:
+                        logger.error(f"S3 download failed for key {key}: {error}")
+                        continue
+                downloaded_paths.append(local_path)
+        if not downloaded_paths:
+            logger.warning("No anchor tree files found in s3://%s/%s", s3_bucket, s3_prefix or "")
+        return downloaded_paths
+    except Exception as error:
+        raise RuntimeError(f"S3 anchor tree download failed: {error}") from error
 
 
 def generate_minimized_html(
@@ -235,39 +256,43 @@ def bulk_update_minimized_database(results: list[tuple[str, str]]) -> None:
         conn.commit()
 
 
+
 # Module-level globals — one instance per worker process
 _process_s3_client = None
-_process_boilerplate_remover = None
+_process_boilerplate_removers: dict[str, BoilerplateRemover] = {}
 
 
 def _init_process_worker():
     """Initializer called once per worker process before any tasks run."""
-    global _process_s3_client, _process_boilerplate_remover
-    logger.debug("Creating BoilerplateRemover instance for process")
-    _process_boilerplate_remover = BoilerplateRemover()
-    logger.debug("BoilerplateRemover instance created for process")
+    global _process_s3_client, _process_boilerplate_removers
+    logger.debug("Initializing process worker globals")
+    _process_boilerplate_removers = {}
+    logger.debug("BoilerplateRemover dict initialized for process")
     logger.debug("Creating S3 client for process")
     _process_s3_client = boto3.client("s3", region_name="eu-west-1")
     logger.debug("S3 client created for process")
 
 
-def _get_worker_resources():
+def _get_worker_resources(domain: str):
     """Return process-level resources, initializing lazily if needed."""
-    global _process_s3_client, _process_boilerplate_remover
-    if _process_boilerplate_remover is None:
-        logger.debug("Creating BoilerplateRemover instance for process")
-        _process_boilerplate_remover = BoilerplateRemover()
-        logger.debug("BoilerplateRemover instance created for process")
+    global _process_s3_client, _process_boilerplate_removers
+    if domain not in _process_boilerplate_removers:
+        logger.debug(f"Creating BoilerplateRemover instance for domain '{domain}' in process")
+        anchor_tree_cache_path = f".cache/anchor_trees/anchor_tree_{domain.replace('/', '_')}.pkl"
+        logger.debug(f"Reading cached anchor_tree from %s", anchor_tree_cache_path)
+        _process_boilerplate_removers[domain] = BoilerplateRemover(cache_path=anchor_tree_cache_path)
+        logger.debug(f"BoilerplateRemover instance created for domain '{domain}' in process")
     if _process_s3_client is None:
         logger.debug("Creating S3 client for process")
         _process_s3_client = boto3.client("s3", region_name="eu-west-1")
         logger.debug("S3 client created for process")
-    return _process_s3_client, _process_boilerplate_remover
+    return _process_s3_client, _process_boilerplate_removers[domain]
 
 
 def _minimize_worker(item: tuple[str, str]) -> tuple[str, str]:
     s3_key, url = item
-    s3_client, boilerplate_remover = _get_worker_resources()
+    domain = get_domain_from_url(url)
+    s3_client, boilerplate_remover = _get_worker_resources(domain)
 
     logger.debug("Minimizing %s", url)
     minimized_html = generate_minimized_html(s3_key, url, s3_client, boilerplate_remover)
@@ -278,6 +303,14 @@ def _minimize_worker(item: tuple[str, str]) -> tuple[str, str]:
 
     return minimized_s3_key, url
 
+def get_domain_from_url(url: str) -> str:
+    # Simple extraction of domain from URL for logging purposes
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+        return parsed.netloc
+    except Exception:
+        return "unknown_domain"
 
 if __name__ == "__main__":
     try:
@@ -288,7 +321,7 @@ if __name__ == "__main__":
         pending_count = len(items)
         logger.debug("%s pages to minimize", pending_count)
 
-        download_anchor_tree_from_s3()
+        download_anchor_trees_from_s3()
 
         completed: list[tuple[str, str]] = []  # (url, minimized_s3_key)
 
