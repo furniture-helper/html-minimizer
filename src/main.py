@@ -304,11 +304,14 @@ def _minimize_worker(item: tuple[str, str]) -> tuple[str, str]:
     return minimized_s3_key, url
 
 def get_domain_from_url(url: str) -> str:
-    # Simple extraction of domain from URL for logging purposes
+    # Normalize domain so variants like www.example.com map to example.com
     try:
         from urllib.parse import urlparse
         parsed = urlparse(url)
-        return parsed.netloc
+        domain = parsed.netloc.lower().strip()
+        if domain.startswith("www."):
+            domain = domain[4:]
+        return domain or "unknown_domain"
     except Exception:
         return "unknown_domain"
 
