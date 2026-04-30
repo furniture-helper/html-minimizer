@@ -135,6 +135,7 @@ def get_s3_keys_to_minimize() -> list[tuple[str, str]]:
         )
           AND pages.is_active = true
           AND pages.s3_key != 'NOT_CRAWLED'
+          AND pages.s3_key != 'REDIRECT'
         ORDER BY pages.last_crawled_at ASC
         LIMIT %s
     """
