@@ -3,7 +3,7 @@ import json
 
 from kafka import KafkaProducer as KafkaProducerClient
 
-from src.helpers.ecs_helpers import get_host, get_region
+from helpers.ecs_helpers import get_host, get_region
 
 
 class KafkaService:

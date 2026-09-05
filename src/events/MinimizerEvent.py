@@ -1,4 +1,4 @@
-from src.helpers.url_helpers import get_domain_from_url
+from helpers.url_helpers import get_domain_from_url
 
 
 class MinimizerEvent:
@@ -14,5 +14,6 @@ class MinimizerEvent:
             "url": self.url,
             "domain": self.domain,
             "original_size_bytes": self.original_size_bytes,
-            "minimized_size_bytes": self.minimized_size_bytes
+            "minimized_size_bytes": self.minimized_size_bytes,
         }
+

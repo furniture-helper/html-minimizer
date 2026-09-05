@@ -11,8 +11,8 @@ import psycopg
 from boilerplate_remover.BoilerplateRemover import BoilerplateRemover
 from botocore.exceptions import BotoCoreError, ClientError
 
-from src.services.KafkaService import KafkaService
-from src.types.MinimizerEvent import MinimizerEvent
+from services.KafkaService import KafkaService
+from events.MinimizerEvent import MinimizerEvent
 
 VALID_LOG_LEVELS = {
     "CRITICAL": logging.CRITICAL,
