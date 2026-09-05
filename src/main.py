@@ -11,6 +11,8 @@ import psycopg
 from boilerplate_remover.BoilerplateRemover import BoilerplateRemover
 from botocore.exceptions import BotoCoreError, ClientError
 
+from src.services.KafkaService import KafkaService
+from src.types.MinimizerEvent import MinimizerEvent
 
 VALID_LOG_LEVELS = {
     "CRITICAL": logging.CRITICAL,
@@ -207,18 +209,21 @@ def generate_minimized_html(
     url: str,
     s3_client,
     boilerplate_remover: BoilerplateRemover,
-) -> str:
+) -> tuple[str, int, int]:
     raw_bucket = _require_env("RAW_HTML_S3_BUCKET")
     rel_key = _safe_rel_key(s3_key)
 
     logger.debug("Downloading raw HTML for %s", url)
     html_content = s3_client.get_object(Bucket=raw_bucket, Key=s3_key)["Body"].read().decode("utf-8")
+    original_size = len(html_content.encode("utf-8"))
     logger.debug("Downloaded raw HTML for %s", url)
 
     minimized_tree = boilerplate_remover.get_minimized_tree_from_string(html_content)
     logger.debug("Generated minimized tree for %s", url)
 
-    return minimized_tree.to_html()
+    minimized_html = minimized_tree.to_html()
+    minimized_size = len(minimized_html.encode("utf-8"))
+    return minimized_html, original_size, minimized_size
 
 
 def upload_minimized_html_to_s3(s3_client, html: str, source_s3_key: str) -> str:
@@ -235,11 +240,7 @@ def upload_minimized_html_to_s3(s3_client, html: str, source_s3_key: str) -> str
     return output_key
 
 
-def update_minimized_database(url: str, minimized_s3_key: str) -> None:
-    bulk_update_minimized_database([(url, minimized_s3_key)])
-
-
-def bulk_update_minimized_database(results: list[tuple[str, str]]) -> None:
+def bulk_update_minimized_database(results: list[tuple[str, str, int, int]]) -> None:
     """Upsert multiple pages in a single DB round-trip."""
     if not results:
         return
@@ -253,9 +254,8 @@ def bulk_update_minimized_database(results: list[tuple[str, str]]) -> None:
     """
     with get_db_connection() as conn:
         with conn.cursor() as cur:
-            cur.executemany(query, results)
+            cur.executemany(query, [(url, s3_key) for url, s3_key, _, _ in results])
         conn.commit()
-
 
 
 # Module-level globals — one instance per worker process
@@ -290,19 +290,19 @@ def _get_worker_resources(domain: str):
     return _process_s3_client, _process_boilerplate_removers[domain]
 
 
-def _minimize_worker(item: tuple[str, str]) -> tuple[str, str]:
+def _minimize_worker(item: tuple[str, str]) -> tuple[str, str, int, int]:
     s3_key, url = item
     domain = get_domain_from_url(url)
     s3_client, boilerplate_remover = _get_worker_resources(domain)
 
     logger.debug("Minimizing %s", url)
-    minimized_html = generate_minimized_html(s3_key, url, s3_client, boilerplate_remover)
+    minimized_html, original_size, minimized_size = generate_minimized_html(s3_key, url, s3_client, boilerplate_remover)
     logger.debug("Minimized %s", url)
 
     minimized_s3_key = upload_minimized_html_to_s3(s3_client, minimized_html, s3_key)
     logger.debug("Uploaded %s", url)
 
-    return minimized_s3_key, url
+    return minimized_s3_key, url, original_size, minimized_size
 
 def get_domain_from_url(url: str) -> str:
     # Normalize domain so variants like www.example.com map to example.com
@@ -320,6 +320,7 @@ if __name__ == "__main__":
     try:
         _require_env("RAW_HTML_S3_BUCKET")
         _require_env("MINIMIZED_HTML_S3_BUCKET")
+        _require_env("KAFKA_BROKER_URLS")
 
         items = get_s3_keys_to_minimize()
         pending_count = len(items)
@@ -327,7 +328,7 @@ if __name__ == "__main__":
 
         download_anchor_trees_from_s3()
 
-        completed: list[tuple[str, str]] = []  # (url, minimized_s3_key)
+        completed: list[tuple[str, str, int, int]] = []  # (url, minimized_s3_key, original_size, minimized_size)
 
         max_workers = int(_env("MAX_WORKERS", default="4"))
         with ProcessPoolExecutor(max_workers=max_workers, initializer=_init_process_worker) as executor:
@@ -337,8 +338,8 @@ if __name__ == "__main__":
                 source_s3_key, url = futures[future]
                 pending_count -= 1
                 try:
-                    minimized_s3_key, _ = future.result()
-                    completed.append((url, minimized_s3_key))
+                    minimized_s3_key, _, original_size, minimized_size = future.result()
+                    completed.append((url, minimized_s3_key, original_size, minimized_size))
                     logger.info(
                         "Minimized: %s (%s -> %s) (%s remaining)",
                         url,
@@ -356,6 +357,14 @@ if __name__ == "__main__":
         if completed:
             bulk_update_minimized_database(completed)
             logger.debug("Bulk updated minimized database for %d pages", len(completed))
+
+            kafkaService = KafkaService(os.getenv("KAFKA_BROKER_URLS"), "minimizer-events")
+            for url, _, original_size, minimized_size in completed:
+                event = MinimizerEvent(url, original_size, minimized_size).to_dict()
+                kafkaService.send_message(event)
+                logger.debug("Sent minimizer event to Kafka for %s", url)
+
+            kafkaService.close()
 
     except (RuntimeError, psycopg.Error):
         logger.exception("Error while running minimizer")
