@@ -13,6 +13,7 @@ from botocore.exceptions import BotoCoreError, ClientError
 
 from services.KafkaService import KafkaService
 from events.MinimizerEvent import MinimizerEvent
+from helpers.rds_iam_postgres import RdsIamPostgresCredentials
 
 VALID_LOG_LEVELS = {
     "CRITICAL": logging.CRITICAL,
@@ -46,6 +47,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 logger.setLevel(_get_log_level())
+
+_db_credentials_provider = RdsIamPostgresCredentials()
 
 
 def _env(*names: str, default: Optional[str] = None) -> Optional[str]:
@@ -84,33 +87,8 @@ def get_db_connection():
     if database_url:
         return psycopg.connect(database_url, connect_timeout=connect_timeout)
 
-    required_settings = {
-        "host": ("PGHOST", "PG_HOST"),
-        "port": ("PGPORT", "PG_PORT"),
-        "dbname": ("PGDATABASE", "PG_DATABASE"),
-        "user": ("PGUSER", "PG_USER"),
-        "password": ("PGPASSWORD", "PG_PASSWORD"),
-    }
-
-    connection_kwargs = {}
-    missing = []
-    for conn_key, env_names in required_settings.items():
-        default = "5432" if conn_key == "port" else None
-        value = _env(*env_names, default=default)
-        if not value:
-            missing.append("/".join(env_names))
-        else:
-            connection_kwargs[conn_key] = value
-
-    if missing:
-        raise RuntimeError(
-            "Missing PostgreSQL settings. Set DATABASE_URL or provide: "
-            "PGHOST/PG_HOST, PGPORT/PG_PORT, PGDATABASE/PG_DATABASE, "
-            "PGUSER/PG_USER, PGPASSWORD/PG_PASSWORD. "
-            f"Missing: {', '.join(missing)}"
-        )
-
-    return psycopg.connect(**connection_kwargs, connect_timeout=connect_timeout)
+    credentials = _db_credentials_provider.get_connection_kwargs()
+    return psycopg.connect(**credentials, connect_timeout=connect_timeout)
 
 
 def _get_batch_limit() -> int:
